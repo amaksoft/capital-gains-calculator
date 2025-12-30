@@ -12,11 +12,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from cgt_calc.currency_converter import CurrencyConverter
-from cgt_calc.current_price_fetcher import CurrentPriceFetcher
-from cgt_calc.initial_prices import InitialPrices
 from cgt_calc.isin_converter import IsinConverter
 from cgt_calc.main import CapitalGainsCalculator
 from cgt_calc.model import ActionType, BrokerTransaction
+from cgt_calc.price_fetchers.base_fetcher import (
+    PriceMissingError as HistoricalPriceMissingError,
+)
 from cgt_calc.spin_off_handler import SpinOffHandler
 from cgt_calc.util import round_decimal
 from tests.utils import build_cmd
@@ -30,6 +31,42 @@ if TYPE_CHECKING:
 
 # USD to GBP exchange rate used in tests (creates repeating decimals)
 USD_TO_GBP = Decimal(6) / Decimal(7)  # 0.857142857...
+
+
+class MockPriceFetcher:
+    """Mock price fetcher for tests that returns predefined prices."""
+
+    def __init__(
+        self,
+        historical_prices: dict[str, dict[datetime.date, Decimal]],
+        current_prices: dict[str, Decimal | None] | None = None,
+    ):
+        """Initialize with price data."""
+        self._historical_prices = historical_prices
+        self._current_prices = current_prices or {}
+
+    def get_closing_price(self, symbol: str, date: datetime.date) -> Decimal:
+        """Get historical closing price from test data."""
+        if (
+            symbol not in self._historical_prices
+            or date not in self._historical_prices[symbol]
+        ):
+            raise HistoricalPriceMissingError(f"Mock: {symbol} on {date}")
+        return self._historical_prices[symbol][date]
+
+    def get_current_market_price(self, symbol: str) -> Decimal | None:
+        """Get current market price from test data."""
+        return self._current_prices.get(symbol)
+
+    @property
+    def name(self) -> str:
+        """Return fetcher name."""
+        return "mock"
+
+    @property
+    def native_currency(self) -> str:
+        """Return native currency (GBP for mock)."""
+        return "GBP"
 
 
 def gbp_from_usd(usd: str, qty: int) -> Decimal:
@@ -48,14 +85,13 @@ def get_report(
 def create_calculator(tax_year: int = 2024) -> CapitalGainsCalculator:
     """Create a calculator with standard test configuration."""
     currency_converter = CurrencyConverter(None, {})
-    price_fetcher = CurrentPriceFetcher(currency_converter, {}, {})
+    price_fetcher = MockPriceFetcher(historical_prices={}, current_prices={})
     return CapitalGainsCalculator(
         tax_year,
         currency_converter,
         IsinConverter(),
         price_fetcher,
         SpinOffHandler(),
-        InitialPrices(),
         interest_fund_tickers=[],
         balance_check=False,
     )
@@ -115,19 +151,17 @@ def test_basic(
         "FOO": {datetime.date(day=5, month=7, year=2023): Decimal(90)},
         "BAR": {datetime.date(day=5, month=7, year=2023): Decimal(12)},
     }
-    price_fetcher = CurrentPriceFetcher(
-        currency_converter, current_prices, historical_prices
+    price_fetcher = MockPriceFetcher(
+        historical_prices=historical_prices, current_prices=current_prices
     )
     spin_off_handler = SpinOffHandler()
     spin_off_handler.cache = {"BAR": "FOO"}
-    initial_prices = InitialPrices()
     calculator = CapitalGainsCalculator(
         tax_year,
         currency_converter,
         isin_converter,
         price_fetcher,
         spin_off_handler,
-        initial_prices,
         interest_fund_tickers=["FOO"],
         calc_unrealized_gains=expected_unrealized is not None,
     )
@@ -215,14 +249,13 @@ def test_bed_and_breakfast_zero_available_quantity_skip() -> None:
     """Later acquisitions are ignored if the disposal was already satisfied."""
 
     currency_converter = CurrencyConverter(None, {})
-    price_fetcher = CurrentPriceFetcher(currency_converter, {}, {})
+    price_fetcher = MockPriceFetcher(historical_prices={}, current_prices={})
     calculator = CapitalGainsCalculator(
         2024,
         currency_converter,
         IsinConverter(),
         price_fetcher,
         SpinOffHandler(),
-        InitialPrices(),
         interest_fund_tickers=[],
     )
 

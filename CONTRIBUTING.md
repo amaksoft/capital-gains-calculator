@@ -99,6 +99,56 @@ uv run mypy cgt_calc
 3. Update documentation and examples
 4. Submit a pull request describing your changes
 
+## 📈 Adding a new stock price fetcher
+
+1. **Create a new fetcher** in `cgt_calc/price_fetchers/`:
+
+   ```python
+   from decimal import Decimal
+   import datetime
+   from .base_fetcher import BasePriceFetcher
+   from .fetcher_registry import register_fetcher
+   from .fetcher_type import FetcherType
+
+   @register_fetcher("myapi", fetcher_type=FetcherType.NETWORK, show_in_help=True, auto_cache=True)
+   class MyApiPriceFetcher(BasePriceFetcher):
+       def __init__(self, deps: FetcherDependencies):
+           self._verbose = deps.verbose
+
+       @property
+       def native_currency(self) -> str:
+           """Return the currency your API returns prices in (e.g., "USD", "EUR")."""
+           return "USD"  # Change to your API's currency
+
+       def get_closing_price(self, symbol: str, date: datetime.date) -> Decimal:
+           """Fetch historical price in native currency.
+
+           The framework will automatically convert to GBP if needed.
+           """
+           # Your API call here
+           price_usd = fetch_from_my_api(symbol, date)
+           return Decimal(str(price_usd))
+
+       def get_current_market_price(self, symbol: str) -> Decimal | None:
+           """Fetch current price in native currency, or None if unavailable."""
+           # Your API call here, or return None if not supported
+           return None
+
+       @property
+       def name(self) -> str:
+           return self.fetcher_name
+   ```
+
+2. **Key points**:
+   - Use `native_currency` property to declare what currency your fetcher returns
+   - The framework automatically wraps non-GBP fetchers with `GbpConvertingFetcher`
+   - Use `auto_cache=True` for network fetchers to avoid redundant API calls
+   - Use `show_in_help=True` for user-facing sources
+   - Return `Decimal` for all prices
+
+3. Add tests in `tests/general/test_price_fetchers.py`
+4. Submit a pull request describing the new source
+
 ## 📦 Managing dependencies
 
 You can manage dependencies either with `uv` commands or by editing `pyproject.toml` directly.

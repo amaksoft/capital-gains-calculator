@@ -16,6 +16,7 @@ from .const import (
     DEFAULT_SPIN_OFF_FILE,
     INTERNAL_START_DATE,
 )
+from .price_fetchers import get_available_fetchers, get_default_fetcher_priority
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -315,6 +316,21 @@ Environment variables:
         dest="initial_prices_file",
         type=existing_file_type,
         help=argparse.SUPPRESS,
+    )
+
+    available_price_sources = get_available_fetchers()
+    default_priority = get_default_fetcher_priority()
+    data_group.add_argument(
+        "--initial-price-sources",
+        type=str,
+        metavar="SOURCE[,SOURCE...]",
+        default=default_priority,
+        help=(
+            "priority order for fetching initial prices (comma-separated). "
+            f"Available sources: {', '.join(repr(s) for s in sorted(available_price_sources))}. "
+            f"Default: '{default_priority}' (try Yahoo Finance first, fallback to CSV). "
+            "Use single source like 'csv' to only use that source."
+        ),
     )
     data_group.add_argument(
         "--eri-raw-file",

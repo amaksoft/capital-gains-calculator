@@ -23,7 +23,6 @@ from .const import (
     UK_CURRENCY,
 )
 from .currency_converter import CurrencyConverter
-from .current_price_fetcher import CurrentPriceFetcher
 from .dates import get_tax_year_end, get_tax_year_start, is_date
 from .exceptions import (
     AmountMissingError,
@@ -36,7 +35,6 @@ from .exceptions import (
     QuantityNotPositiveError,
     SymbolMissingError,
 )
-from .initial_prices import InitialPrices
 from .isin_converter import IsinConverter
 from .model import (
     ActionType,
@@ -60,6 +58,7 @@ from .model import (
     SpinOff,
 )
 from .parsers import read_broker_transactions
+from .price_fetchers import FetcherDependencies, PriceFetcher, create_price_fetcher
 from .setup_logging import setup_logging
 from .spin_off_handler import SpinOffHandler
 from .transaction_log import add_to_list, has_key
@@ -149,9 +148,8 @@ class CapitalGainsCalculator:
         tax_year: int,
         currency_converter: CurrencyConverter,
         isin_converter: IsinConverter,
-        price_fetcher: CurrentPriceFetcher,
+        price_fetcher: PriceFetcher,
         spin_off_handler: SpinOffHandler,
-        initial_prices: InitialPrices,
         interest_fund_tickers: list[str],
         balance_check: bool = True,
         calc_unrealized_gains: bool = False,
@@ -166,7 +164,6 @@ class CapitalGainsCalculator:
         self.isin_converter = isin_converter
         self.price_fetcher = price_fetcher
         self.spin_off_handler = spin_off_handler
-        self.initial_prices = initial_prices
         self.balance_check = balance_check
         self.calc_unrealized_gains = calc_unrealized_gains
         self.interest_fund_tickers = interest_fund_tickers
@@ -220,7 +217,7 @@ class CapitalGainsCalculator:
         # Add to acquisition_list to apply same day rule
         if transaction.action is ActionType.STOCK_ACTIVITY:
             if price is None:
-                price = self.initial_prices.get(transaction.date, symbol)
+                price = self.price_fetcher.get_closing_price(symbol, transaction.date)
             amount = round_decimal(quantity * price, 2)
         elif transaction.action is ActionType.SPIN_OFF:
             price, amount = self.handle_spin_off(transaction)
@@ -1439,8 +1436,20 @@ def calculate_cgt(args: argparse.Namespace) -> None:
         eri_raw_file=args.eri_raw_file,
     )
     currency_converter = CurrencyConverter(args.exchange_rates_file)
-    price_fetcher = CurrentPriceFetcher(currency_converter)
-    initial_prices = InitialPrices(args.initial_prices_file)
+
+    # Create dependencies for price fetchers
+    deps = FetcherDependencies(
+        currency_converter=currency_converter,
+        initial_prices_csv=args.initial_prices_file,
+        verbose=args.verbose,
+    )
+
+    # Create price fetcher (for initial prices, spin-offs, current prices, etc.) - with chaining
+    price_fetcher = create_price_fetcher(
+        priority=args.initial_price_sources,
+        deps=deps,
+    )
+
     spin_off_handler = SpinOffHandler(args.spin_offs_file)
     isin_converter = IsinConverter(args.isin_translation_file)
 
@@ -1450,7 +1459,6 @@ def calculate_cgt(args: argparse.Namespace) -> None:
         isin_converter,
         price_fetcher,
         spin_off_handler,
-        initial_prices,
         args.interest_fund_tickers,
         balance_check=args.balance_check,
         calc_unrealized_gains=args.calc_unrealized_gains,

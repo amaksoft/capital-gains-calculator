@@ -158,6 +158,7 @@ class FakeHistoryTicker:
         """Store the closing price and quote currency to return."""
         self._close = close
         self.info = {"currency": currency}
+        self.splits = pd.Series(dtype=float)
 
     def history(self, **kwargs: str) -> pd.DataFrame:
         """Return a single-row price history."""
@@ -188,5 +189,86 @@ def test_closing_price_converted_at_historical_rate(
     )
 
     price = fetcher.get_closing_price("AAPL", historical_date)
+
+    assert price == Decimal(100) / Decimal("1.25")
+
+
+class FakeSplitTicker:
+    """Stand-in for yf.Ticker carrying a price history and a split history."""
+
+    def __init__(self, close: float, splits: dict[str, float]) -> None:
+        """Store the closing price and the splits to report."""
+        self._close = close
+        self.info = {"currency": "USD"}
+        self.last_history_kwargs: dict[str, object] = {}
+        self.splits = pd.Series(
+            list(splits.values()),
+            index=pd.to_datetime(list(splits.keys())),
+        )
+
+    def history(self, **kwargs: object) -> pd.DataFrame:
+        """Return a single-row price history, recording how it was asked for."""
+        self.last_history_kwargs = kwargs
+        return pd.DataFrame({"Close": [self._close]})
+
+
+def _historical_fetcher(date: datetime.date) -> CurrentPriceFetcher:
+    """Build a fetcher with a known USD rate on the given historical date."""
+    return CurrentPriceFetcher(
+        CurrencyConverter(None, {date: {CurrencyCode("USD"): Decimal("1.25")}})
+    )
+
+
+def test_closing_price_is_not_dividend_adjusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """History is requested unadjusted.
+
+    yfinance defaults to auto_adjust=True, which restates past closes for
+    every dividend paid since, so the same inputs stop producing the same
+    answer as time passes.
+    """
+    ticker = FakeSplitTicker(100.0, {})
+    monkeypatch.setattr(
+        "cgt_calc.current_price_fetcher.yf.Ticker", lambda symbol: ticker
+    )
+
+    date = datetime.date(2021, 5, 10)
+    _historical_fetcher(date).get_closing_price("AAPL", date)
+
+    assert ticker.last_history_kwargs["auto_adjust"] is False
+
+
+def test_closing_price_undoes_a_later_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A split after the valuation date is unwound from the price.
+
+    yfinance restates history in today's share units regardless of
+    auto_adjust, so a 25-for-1 split leaves the earlier close divided by 25.
+    Callers pair this price with a holding counted in the units of the day.
+    """
+    monkeypatch.setattr(
+        "cgt_calc.current_price_fetcher.yf.Ticker",
+        lambda symbol: FakeSplitTicker(100.0, {"2021-06-01": 25.0}),
+    )
+
+    date = datetime.date(2021, 5, 10)
+    price = _historical_fetcher(date).get_closing_price("AAPL", date)
+
+    assert price == Decimal(100) * Decimal(25) / Decimal("1.25")
+
+
+def test_closing_price_ignores_earlier_splits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A split before the valuation date is already in the quoted price."""
+    monkeypatch.setattr(
+        "cgt_calc.current_price_fetcher.yf.Ticker",
+        lambda symbol: FakeSplitTicker(100.0, {"2021-01-01": 25.0}),
+    )
+
+    date = datetime.date(2021, 5, 10)
+    price = _historical_fetcher(date).get_closing_price("AAPL", date)
 
     assert price == Decimal(100) / Decimal("1.25")

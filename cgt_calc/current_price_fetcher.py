@@ -7,6 +7,7 @@ import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+import pandas as pd
 import yfinance as yf  # type: ignore[import-untyped]
 
 if TYPE_CHECKING:
@@ -78,10 +79,27 @@ class CurrentPriceFetcher:
             interval="1d",
             start=date.strftime("%Y-%m-%d"),
             end=(date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+            # yfinance defaults to auto_adjust=True, which back-adjusts closes
+            # for every dividend paid since. That is not the price the share
+            # changed hands at on the day, and it moves every time a dividend
+            # goes ex, so the same inputs stop producing the same report.
+            auto_adjust=False,
         )
         if prices.empty:
             raise MarketDataMissingError(symbol, date)
         closing_price = prices.iloc[0]["Close"]
         closing_price_decimal = Decimal(format(closing_price, ".15g"))
+        # yfinance restates historical prices in today's share units whatever
+        # auto_adjust is set to, so a close from before a split comes back
+        # divided by that split's ratio. Callers multiply this price by a
+        # holding recorded in the units of the day, so a later split would
+        # value the position at a fraction of its worth. Multiplying by the
+        # ratio of every split since restores the price as quoted.
+        splits = yf_ticker.splits
+        for split_date, ratio in zip(
+            pd.DatetimeIndex(splits.index), splits, strict=True
+        ):
+            if split_date.date() > date and ratio:
+                closing_price_decimal *= Decimal(format(ratio, ".15g"))
         currency = yf_ticker.info.get("currency") if yf_ticker.info else None
         return self._convert_to_gbp(closing_price_decimal, currency, date)

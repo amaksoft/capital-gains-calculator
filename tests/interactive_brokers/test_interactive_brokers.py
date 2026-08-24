@@ -163,7 +163,14 @@ Transaction History,Header,Date,Account,Description,Transaction Type,Symbol,Quan
                 f"stdout:\n{result.stdout}\n"
                 f"stderr:\n{result.stderr}"
             )
-        assert result.stderr == ""
+        # The fixture pays dividends on VT and IBKR without ever acquiring
+        # them, which the calculator flags. Nothing else may reach stderr.
+        unexpected = [
+            line
+            for line in result.stderr.splitlines()
+            if line.strip() and "pays income but was never acquired" not in line
+        ]
+        assert unexpected == [], f"Unexpected stderr: {result.stderr}"
         expected_file = (
             Path("tests") / "interactive_brokers" / "data" / "expected_output.txt"
         )

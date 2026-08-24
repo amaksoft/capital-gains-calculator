@@ -148,6 +148,26 @@ def transaction(
     )
 
 
+def capital_distribution_transaction(
+    date: datetime.date,
+    symbol: str,
+    amount: float,
+) -> BrokerTransaction:
+    """Create a small capital distribution (e.g. cash in lieu of a fraction)."""
+    return BrokerTransaction(
+        date,
+        ActionType.CAPITAL_DISTRIBUTION,
+        symbol,
+        f"Cash in lieu for {symbol}",
+        quantity=None,
+        price=None,
+        fees=Decimal(0),
+        amount=round_decimal(Decimal(amount), 6),
+        currency="USD",
+        broker="Testing",
+    )
+
+
 def split_transaction(
     date: datetime.date,
     symbol: str,
@@ -1268,6 +1288,206 @@ calc_basic_data = [
         },
         {},  # Calculation Log Other
         id="split_then_sell",
+    ),
+    pytest.param(
+        2023,  # tax year
+        [
+            transfer_transaction(datetime.date(day=1, month=5, year=2020), 100),
+            buy_transaction(
+                date=datetime.date(day=2, month=5, year=2023),
+                symbol="FOO",
+                quantity=12,
+                price=5,
+                amount=-60,
+                fees=0,
+            ),
+            split_transaction(
+                date=datetime.date(day=15, month=5, year=2023),
+                symbol="FOO",
+                quantity=-6,  # 1-for-2 reverse split, pool cost unchanged
+            ),
+            sell_transaction(
+                date=datetime.date(day=10, month=6, year=2023),
+                symbol="FOO",
+                quantity=2,
+                price=12,
+                amount=24,  # cost is now 10/unit, so 4.00 gain
+                fees=0,
+            ),
+        ],
+        4.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        {
+            datetime.date(day=2, month=5, year=2023): {
+                "buy$FOO": [
+                    CalculationEntry(
+                        RuleType.SECTION_104,
+                        quantity=Decimal(12),
+                        amount=Decimal(-60),
+                        allowable_cost=Decimal(60),
+                        new_quantity=Decimal(12),
+                        fees=Decimal(0),
+                        new_pool_cost=Decimal(60),
+                    ),
+                ],
+            },
+            datetime.date(day=15, month=5, year=2023): {
+                "consolidation$FOO": [
+                    CalculationEntry(
+                        RuleType.SHARE_CONSOLIDATION,
+                        quantity=Decimal(6),
+                        amount=Decimal(0),
+                        allowable_cost=Decimal(60),
+                        new_quantity=Decimal(6),
+                        fees=Decimal(0),
+                        new_pool_cost=Decimal(60),
+                    ),
+                ],
+            },
+            datetime.date(day=10, month=6, year=2023): {
+                "sell$FOO": [
+                    CalculationEntry(
+                        RuleType.SECTION_104,
+                        quantity=Decimal(2),
+                        amount=Decimal(24),
+                        gain=Decimal(4),
+                        fees=Decimal(0),
+                        allowable_cost=Decimal(20),
+                        new_quantity=Decimal(4),
+                        new_pool_cost=Decimal(40),
+                    ),
+                ],
+            },
+        },
+        {},  # Calculation Log Other
+        id="reverse_split_then_sell",
+    ),
+    pytest.param(
+        2023,  # tax year
+        [
+            transfer_transaction(datetime.date(day=1, month=5, year=2020), 100),
+            buy_transaction(
+                date=datetime.date(day=2, month=5, year=2023),
+                symbol="FOO",
+                quantity=10,
+                price=6,
+                amount=-60,
+                fees=0,
+            ),
+            # Cash in lieu of a fraction: deducted from the pool cost rather
+            # than treated as a part disposal, so no gain arises now.
+            capital_distribution_transaction(
+                date=datetime.date(day=15, month=5, year=2023),
+                symbol="FOO",
+                amount=10,
+            ),
+            sell_transaction(
+                date=datetime.date(day=10, month=6, year=2023),
+                symbol="FOO",
+                quantity=10,
+                price=8,
+                amount=80,  # cost is now 50, so 30.00 gain
+                fees=0,
+            ),
+        ],
+        30.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        {
+            datetime.date(day=2, month=5, year=2023): {
+                "buy$FOO": [
+                    CalculationEntry(
+                        RuleType.SECTION_104,
+                        quantity=Decimal(10),
+                        amount=Decimal(-60),
+                        allowable_cost=Decimal(60),
+                        new_quantity=Decimal(10),
+                        fees=Decimal(0),
+                        new_pool_cost=Decimal(60),
+                    ),
+                ],
+            },
+            datetime.date(day=15, month=5, year=2023): {
+                "distribution$FOO": [
+                    CalculationEntry(
+                        RuleType.CAPITAL_DISTRIBUTION,
+                        quantity=Decimal(0),
+                        amount=Decimal(10),
+                        allowable_cost=Decimal(10),
+                        new_quantity=Decimal(10),
+                        fees=Decimal(0),
+                        new_pool_cost=Decimal(50),
+                    ),
+                ],
+            },
+            datetime.date(day=10, month=6, year=2023): {
+                "sell$FOO": [
+                    CalculationEntry(
+                        RuleType.SECTION_104,
+                        quantity=Decimal(10),
+                        amount=Decimal(80),
+                        gain=Decimal(30),
+                        fees=Decimal(0),
+                        allowable_cost=Decimal(50),
+                        new_quantity=Decimal(0),
+                        new_pool_cost=Decimal(0),
+                    ),
+                ],
+            },
+        },
+        {},  # Calculation Log Other
+        id="capital_distribution_reduces_pool_cost",
+    ),
+    pytest.param(
+        2023,  # tax year
+        [
+            transfer_transaction(datetime.date(day=1, month=5, year=2020), 100),
+            buy_transaction(
+                date=datetime.date(day=2, month=5, year=2023),
+                symbol="FOO",
+                quantity=20,
+                price=5,
+                amount=-100,
+                fees=0,
+            ),
+            # Consolidation and sale land on the same day. The units sold are
+            # the new ones, so the cost must be apportioned over 10, not 20.
+            split_transaction(
+                date=datetime.date(day=15, month=5, year=2023),
+                symbol="FOO",
+                quantity=-10,
+            ),
+            sell_transaction(
+                date=datetime.date(day=15, month=5, year=2023),
+                symbol="FOO",
+                quantity=5,
+                price=12,
+                amount=60,  # cost 50 of the 100 pool, so 10.00 gain
+                fees=0,
+            ),
+        ],
+        10.00,  # Expected capital gain/loss
+        None,  # Expected unrealized gains
+        None,  # GBP/USD prices
+        None,  # Current prices
+        0.00,  # Expected UK interest
+        0.00,  # Expected foreign interest
+        0.00,  # Expected dividend
+        0.00,  # Expected dividend gain
+        None,  # Calculation Log
+        {},  # Calculation Log Other
+        id="consolidation_applies_before_same_day_disposal",
     ),
     pytest.param(
         2023,  # tax year

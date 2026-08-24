@@ -102,6 +102,12 @@ INTERNAL_START_DATE: Final = datetime.date(2010, 1, 1)
 # See: https://www.gov.uk/hmrc-internal-manuals/capital-gains-manual/cg51560
 BED_AND_BREAKFAST_DAYS: Final = 30
 
+# A capital distribution at or below this amount is "small" for the purposes of
+# TCGA 1992 s.122, so it may be deducted from the allowable cost instead of
+# being treated as a part disposal. HMRC also accepts a 5%-of-value test, which
+# needs a market valuation and so is not applied here. Ref: HMRC CG57835.
+CAPITAL_DISTRIBUTION_SMALL_LIMIT: Final = 3000
+
 UK_CURRENCY: Final = "GBP"
 ERI_TAX_DATE_DELTA: Final = relativedelta(months=6)
 

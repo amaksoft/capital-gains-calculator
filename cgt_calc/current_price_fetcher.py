@@ -61,6 +61,28 @@ class CurrentPriceFetcher:
         market_price_decimal = Decimal(format(market_price, ".15g"))
         return self._convert_to_gbp(market_price_decimal, ticker.get("currency"))
 
+    @staticmethod
+    def _split_factor_after(yf_ticker: yf.Ticker, date: datetime.date) -> Decimal:
+        """Return the factor that undoes split back-adjustment for a date.
+
+        yfinance always restates historical prices in today's share units, so a
+        close from before a split comes back divided by that split's ratio.
+        That is the wrong basis here: the price gets multiplied by a holding
+        recorded in the units of the day, so a later split would silently value
+        the position at a fraction of its worth. Multiplying by the ratio of
+        every split since restores the price actually quoted on the day.
+        """
+        factor = Decimal(1)
+        try:
+            splits = yf_ticker.splits
+        except Exception:  # noqa: BLE001 - price data must not fail on this
+            return factor
+
+        for split_date, ratio in splits.items():
+            if split_date.date() > date and ratio:
+                factor *= Decimal(format(ratio, ".15g"))
+        return factor
+
     def get_closing_price(self, symbol: str, date: datetime.date) -> Decimal:
         """Get the price of the share on closing time."""
         with suppress(KeyError):
@@ -71,8 +93,15 @@ class CurrentPriceFetcher:
             interval="1d",
             start=date.strftime("%Y-%m-%d"),
             end=(date + datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+            # yfinance defaults to auto_adjust=True, which back-adjusts closes
+            # for every dividend paid since. That is the wrong number for a
+            # historical valuation - a spin-off apportionment has to use the
+            # price actually quoted on the day - and it is not reproducible,
+            # because the adjustment factor moves each time a dividend goes ex.
+            auto_adjust=False,
         )
         closing_price = prices.iloc[0]["Close"]
         closing_price_decimal = Decimal(format(closing_price, ".15g"))
+        closing_price_decimal *= self._split_factor_after(yf_ticker, date)
         currency = yf_ticker.info.get("currency") if yf_ticker.info else None
         return self._convert_to_gbp(closing_price_decimal, currency)

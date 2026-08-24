@@ -111,7 +111,6 @@ def action_from_str(label: str, file: Path) -> ActionType:
         "Wire Transfer",
         "Funds Received",
         "Journal",
-        "Cash In Lieu",
     }:
         return ActionType.TRANSFER
 
@@ -141,6 +140,9 @@ def action_from_str(label: str, file: Path) -> ActionType:
 
     if label == "Spin-off":
         return ActionType.SPIN_OFF
+
+    if label == "Cash In Lieu":
+        return ActionType.CAPITAL_DISTRIBUTION
 
     if label == "Credit Interest":
         return ActionType.INTEREST

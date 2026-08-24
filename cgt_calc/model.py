@@ -157,6 +157,7 @@ class ActionType(Enum):
     FULL_REDEMPTION = 18
     RENAME = 19
     INTEREST_TAX = 20
+    CAPITAL_DISTRIBUTION = 21
 
 
 class CalculationType(Enum):
@@ -202,6 +203,8 @@ class RuleType(Enum):
     EXCESS_REPORTED_INCOME_DISTRIBUTION = 8
     RENAME = 9
     INTEREST_TAX = 10
+    SHARE_CONSOLIDATION = 11
+    CAPITAL_DISTRIBUTION = 12
 
 
 @dataclass
@@ -271,6 +274,8 @@ class CalculationEntry:
             RuleType.INTEREST_TAX,
             RuleType.EXCESS_REPORTED_INCOME_DISTRIBUTION,
             RuleType.RENAME,
+            RuleType.SHARE_CONSOLIDATION,
+            RuleType.CAPITAL_DISTRIBUTION,
         ):
             assert self.gain == self.amount + self.fees - self.allowable_cost, (
                 f"Mismatch: {self.gain} != "

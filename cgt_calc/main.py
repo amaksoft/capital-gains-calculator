@@ -15,6 +15,7 @@ from . import render_latex
 from .args_parser import create_parser
 from .const import (
     BED_AND_BREAKFAST_DAYS,
+    CAPITAL_DISTRIBUTION_SMALL_LIMIT,
     CAPITAL_GAIN_ALLOWANCES,
     DIVIDEND_ALLOWANCES,
     DIVIDEND_CURRENCY_TO_COUNTRY,
@@ -183,6 +184,16 @@ class CapitalGainsCalculator:
         self.split_list: dict[tuple[str, datetime.date], Decimal] = {}
         # Stores old->new mapping when a symbol changes its name.
         self.rename_list: dict[datetime.date, dict[str, str]] = defaultdict(dict)
+        # Number of units cancelled by a share consolidation (reverse split),
+        # which reduces the unit count without changing the pool cost.
+        self.consolidation_list: dict[datetime.date, dict[str, Decimal]] = defaultdict(
+            dict
+        )
+        # Small capital distributions in GBP, which reduce the pool cost
+        # without changing the unit count.
+        self.capital_distribution_list: dict[datetime.date, dict[str, Decimal]] = (
+            defaultdict(dict)
+        )
 
         self.dividend_list: ForeignAmountLog = defaultdict(ForeignCurrencyAmount)
         self.dividend_tax_list: ForeignAmountLog = defaultdict(ForeignCurrencyAmount)
@@ -508,6 +519,13 @@ class CapitalGainsCalculator:
         total_disposal_proceeds = Decimal(0)
         balance_history: list[Decimal] = []
 
+        # Raised up front so the diagnostic still appears if the main loop
+        # below stops on an unrelated error. Skipped when balance checking is
+        # off, since that flag means the transaction record is knowingly
+        # partial and acquisitions are expected to be missing.
+        if self.balance_check:
+            self._warn_about_income_without_holdings(transactions)
+
         for transaction in transactions:
             self.isin_converter.add_from_transaction(transaction)
 
@@ -562,13 +580,7 @@ class CapitalGainsCalculator:
             ]:
                 self.add_acquisition(transaction)
             elif transaction.action == ActionType.STOCK_SPLIT:
-                # Calculate the multiplier based on portfolio and received shares
-                acquired_quantity = get_quantity_or_fail(transaction)
-                symbol = get_symbol_or_fail(transaction)
-                holding_quantity = self.portfolio[symbol].quantity
-                multiplier = (acquired_quantity + holding_quantity) / holding_quantity
-                self.split_list[(symbol, transaction.date)] = multiplier
-                self.add_acquisition(transaction)
+                self.record_stock_split(transaction)
             elif transaction.action in [ActionType.DIVIDEND, ActionType.CAPITAL_GAIN]:
                 amount = get_amount_or_fail(transaction)
                 symbol = get_symbol_or_fail(transaction)
@@ -589,9 +601,13 @@ class CapitalGainsCalculator:
                 )
                 if self.date_in_tax_year(transaction.date):
                     dividends_tax[(symbol, currency)] += amount
-            elif transaction.action is ActionType.ADJUSTMENT:
-                amount = get_amount_or_fail(transaction)
-                new_balance += amount
+            elif transaction.action is ActionType.CAPITAL_DISTRIBUTION:
+                new_balance += self.record_capital_distribution(transaction)
+            elif transaction.action in [
+                ActionType.ADJUSTMENT,
+                ActionType.WIRE_FUNDS_RECEIVED,
+            ]:
+                new_balance += get_amount_or_fail(transaction)
             elif transaction.action is ActionType.INTEREST:
                 amount = get_amount_or_fail(transaction)
                 new_balance += amount
@@ -608,9 +624,6 @@ class CapitalGainsCalculator:
                 ] += ForeignCurrencyAmount(amount, transaction.currency)
                 if self.date_in_tax_year(transaction.date):
                     interest_taxes[(transaction.broker, transaction.currency)] += amount
-            elif transaction.action is ActionType.WIRE_FUNDS_RECEIVED:
-                amount = get_amount_or_fail(transaction)
-                new_balance += amount
             elif transaction.action is ActionType.RENAME:
                 new_symbol = get_symbol_or_fail(transaction)
                 assert transaction.description.startswith(RENAME_DESCRIPTION_PREFIX)
@@ -654,6 +667,48 @@ class CapitalGainsCalculator:
             interest_taxes,
             total_disposal_proceeds,
         )
+
+    @staticmethod
+    def _warn_about_income_without_holdings(
+        transactions: list[BrokerTransaction],
+    ) -> None:
+        """Warn about symbols that pay income but were never acquired.
+
+        A symbol that pays dividends without ever being bought usually means the
+        broker booked one holding under two identifiers, so the income sits on a
+        symbol with no pool while the units sit on another. The first disposal
+        under the income-bearing symbol would then fail, or worse, be matched
+        against the wrong cost basis.
+
+        It can also legitimately mean the acquisition predates the imported
+        history, which is why this is a warning rather than an error, and why
+        the caller skips it entirely for knowingly partial records.
+        """
+        acquired: set[str] = set()
+        income: set[str] = set()
+
+        for transaction in transactions:
+            if transaction.symbol is None:
+                continue
+            if transaction.action in [
+                ActionType.BUY,
+                ActionType.REINVEST_SHARES,
+                ActionType.STOCK_ACTIVITY,
+                ActionType.SPIN_OFF,
+                ActionType.STOCK_SPLIT,
+                ActionType.TRANSFER,
+            ]:
+                acquired.add(transaction.symbol)
+            elif transaction.action in [ActionType.DIVIDEND, ActionType.CAPITAL_GAIN]:
+                income.add(transaction.symbol)
+
+        for symbol in sorted(income - acquired):
+            LOGGER.warning(
+                "%s pays income but was never acquired in the imported history. "
+                "Check whether the broker books this holding under another "
+                "symbol too, which would split it into two separate pools.",
+                symbol,
+            )
 
     def first_pass_report(
         self,
@@ -1099,6 +1154,32 @@ class CapitalGainsCalculator:
             spin_off_entry,
         )
 
+    def process_reorganisations(
+        self,
+        date_index: datetime.date,
+        tax_year_start_index: datetime.date,
+        calculation_log: CalculationLog,
+    ) -> None:
+        """Apply the reorganisations falling on one date.
+
+        These adjust an existing holding rather than acquiring or disposing of
+        anything, so they run after that date's acquisitions but before its
+        disposals: a sale on the day of a consolidation is denominated in the
+        new units, so apportioning its cost over the pre-consolidation unit
+        count would understate the allowable cost and overstate the gain.
+        """
+        for symbol, distributed in self.capital_distribution_list.get(
+            date_index, {}
+        ).items():
+            maybe_entry = self.process_capital_distribution(symbol, distributed)
+            if maybe_entry and date_index >= tax_year_start_index:
+                calculation_log[date_index][f"distribution${symbol}"] = [maybe_entry]
+
+        for symbol, cancelled in self.consolidation_list.get(date_index, {}).items():
+            entry = self.process_consolidation(symbol, cancelled)
+            if date_index >= tax_year_start_index:
+                calculation_log[date_index][f"consolidation${symbol}"] = [entry]
+
     def process_rename(self, old: str, new: str) -> CalculationEntry:
         """Transfer pool from old ticker to new ticker (no disposal)."""
         pos = self.portfolio.pop(old, Position())
@@ -1112,6 +1193,194 @@ class CapitalGainsCalculator:
             new_pool_cost=self.portfolio[new].amount,
             allowable_cost=pos.amount,
             renamed_to=new,
+        )
+
+    def record_capital_distribution(self, transaction: BrokerTransaction) -> Decimal:
+        """Record a capital distribution during the first pass.
+
+        The pool cost is reduced later, once that date's acquisitions and
+        disposals have been applied.
+
+        Returns:
+            The cash received, to be added to the running balance.
+
+        """
+        amount = get_amount_or_fail(transaction)
+        symbol = transaction.symbol
+
+        if symbol is None:
+            # Schwab leaves the symbol blank on some cash in lieu rows. Before
+            # these were routed here they booked as a plain cash transfer and
+            # needed no symbol, so falling back to that keeps a raw export
+            # working rather than aborting the run on a few pence.
+            LOGGER.warning(
+                "Capital distribution of %s %s on %s has no symbol, so it "
+                "cannot be deducted from a pool cost and is booked as cash. "
+                "The cost basis of whichever holding it relates to will be "
+                "slightly overstated: %s",
+                transaction.currency,
+                amount,
+                transaction.date,
+                transaction.description,
+            )
+            return amount
+
+        date = transaction.date
+        self.capital_distribution_list[date][symbol] = self.capital_distribution_list[
+            date
+        ].get(symbol, Decimal(0)) + self.currency_converter.to_gbp_for(
+            amount, transaction
+        )
+        return amount
+
+    def record_stock_split(self, transaction: BrokerTransaction) -> None:
+        """Record a stock split or share consolidation during the first pass.
+
+        Schwab reports both as a change in unit count with no cash involved.
+        A positive change is a forward split, booked as a zero-cost
+        acquisition; a negative one is a consolidation, where units are
+        cancelled and the pool cost is left alone. Either way the multiplier is
+        recorded for the bed and breakfast quantity adjustment.
+        """
+        acquired_quantity = get_quantity_or_fail(transaction)
+        symbol = get_symbol_or_fail(transaction)
+        holding_quantity = self.portfolio[symbol].quantity
+
+        if holding_quantity <= 0:
+            raise InvalidTransactionError(
+                transaction,
+                "Stock split of a symbol which is not held at that date",
+            )
+        if acquired_quantity + holding_quantity <= 0:
+            # A split has to leave a holding behind. Cancelling all of it (or
+            # more) is a liquidation, and the cost basis treatment differs, so
+            # refuse rather than guess.
+            raise InvalidTransactionError(
+                transaction,
+                f"Stock split leaves no units: {holding_quantity} held and "
+                f"{-acquired_quantity} cancelled at that date",
+            )
+
+        self.split_list[(symbol, transaction.date)] = (
+            acquired_quantity + holding_quantity
+        ) / holding_quantity
+
+        if acquired_quantity > 0:
+            self.add_acquisition(transaction)
+            return
+
+        # Share consolidation (reverse split): units are cancelled instead of
+        # added. It is a reorganisation, not a disposal, so the pool cost is
+        # unchanged.
+        self.consolidation_list[transaction.date][symbol] = (
+            self.consolidation_list[transaction.date].get(symbol, Decimal(0))
+            - acquired_quantity
+        )
+        # Keep the running holding in step, exactly as add_acquisition does for
+        # the forward-split branch above. Later events in this pass - split
+        # multipliers, spin-off apportionment, the over-sell guard - read it.
+        self.portfolio[symbol] = Position(
+            holding_quantity + acquired_quantity,
+            self.portfolio[symbol].amount,
+        )
+
+    def process_capital_distribution(
+        self,
+        symbol: str,
+        amount: Decimal,
+    ) -> CalculationEntry | None:
+        """Deduct a small capital distribution from the pool cost.
+
+        Cash received on a reorganisation - most often cash in lieu of a
+        fractional share left over by a spin-off, split or consolidation - is
+        strictly a part disposal of the holding. Where the sum is small, HMRC
+        instead allows it to be deducted from the allowable cost, so that no
+        gain arises now and the whole receipt is picked up when the holding is
+        eventually sold. "Small" is taken as £3,000 or less; the alternative
+        5%-of-value test needs a market valuation we do not have here.
+
+        Ref: TCGA 1992 s.122, and HMRC CG57835.
+        """
+        # .get() rather than indexing: self.portfolio is a defaultdict, so
+        # indexing a symbol that is not held would insert an empty Position and
+        # leave a phantom 0-unit line in the final portfolio.
+        position = self.portfolio.get(symbol, Position())
+
+        if position.quantity <= 0:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s, which is not held at that "
+                "date; leaving it as cash. If this relates to a holding outside "
+                "the imported history, the cost basis will be overstated.",
+                round_decimal(amount, 2),
+                symbol,
+            )
+            return None
+
+        if amount > CAPITAL_DISTRIBUTION_SMALL_LIMIT:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s is above the £%s small "
+                "distribution limit, so HMRC's deduction treatment may not apply "
+                "and a part disposal may need to be computed instead. Deducting "
+                "it from the pool cost for now.",
+                round_decimal(amount, 2),
+                symbol,
+                CAPITAL_DISTRIBUTION_SMALL_LIMIT,
+            )
+
+        deducted = min(amount, position.amount)
+        if deducted < amount:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s exceeds its remaining pool "
+                "cost of £%s. The excess of £%s is a chargeable gain and is not "
+                "calculated automatically.",
+                round_decimal(amount, 2),
+                symbol,
+                round_decimal(position.amount, 2),
+                round_decimal(amount - deducted, 2),
+            )
+
+        self.portfolio[symbol] = Position(
+            position.quantity, normalize_amount(position.amount - deducted)
+        )
+        return CalculationEntry(
+            rule_type=RuleType.CAPITAL_DISTRIBUTION,
+            quantity=Decimal(0),
+            amount=amount,
+            fees=Decimal(0),
+            new_quantity=self.portfolio[symbol].quantity,
+            new_pool_cost=self.portfolio[symbol].amount,
+            allowable_cost=deducted,
+        )
+
+    def process_consolidation(
+        self,
+        symbol: str,
+        cancelled_quantity: Decimal,
+    ) -> CalculationEntry:
+        """Cancel units of a share consolidation, keeping the pool cost."""
+        position = self.portfolio.get(symbol, Position())
+        if cancelled_quantity > position.quantity:
+            raise CalculationError(
+                f"Share consolidation of {symbol} cancels {cancelled_quantity} "
+                f"units but only {position.quantity} are held"
+            )
+        self.portfolio[symbol] = Position(
+            position.quantity - cancelled_quantity, position.amount
+        )
+        new_quantity = self.portfolio[symbol].quantity
+        new_pool_cost = self.portfolio[symbol].amount
+        if new_quantity == 0:
+            # Mirror add_disposal: a nil holding leaves the portfolio rather
+            # than lingering as a 0-unit line still carrying the pool cost.
+            del self.portfolio[symbol]
+        return CalculationEntry(
+            rule_type=RuleType.SHARE_CONSOLIDATION,
+            quantity=cancelled_quantity,
+            amount=Decimal(0),
+            fees=Decimal(0),
+            new_quantity=new_quantity,
+            new_pool_cost=new_pool_cost,
+            allowable_cost=new_pool_cost,
         )
 
     def process_eri(
@@ -1377,6 +1646,10 @@ class CapitalGainsCalculator:
                         calculation_log[date_index][f"buy${symbol}"] = (
                             calculation_entries
                         )
+            self.process_reorganisations(
+                date_index, tax_year_start_index, calculation_log
+            )
+
             if date_index in self.disposal_list:
                 for symbol in self.disposal_list[date_index]:
                     (

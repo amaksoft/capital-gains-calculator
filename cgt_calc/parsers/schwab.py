@@ -32,10 +32,19 @@ OLD_COLUMNS_NUM: Final = 9
 NEW_COLUMNS_NUM: Final = 8
 LOGGER = logging.getLogger(__name__)
 
-# Cancel Buy search window: Arbitrary time window chosen as a sensible limit for
-# how far to search backward from a Cancel Buy to find the original Buy transaction.
-# This is not based on any documented Schwab settlement period - just a practical limit.
+# Cancellation search window: Arbitrary time window chosen as a sensible limit
+# for how far to search back from a cancellation row to find the transaction it
+# reverses. This is not based on any documented Schwab settlement period - just a
+# practical limit.
 CANCEL_BUY_SEARCH_DAYS: Final = 5
+
+# Schwab reports a reversed transaction as a pair: the original row plus a later
+# cancellation row with the same symbol, quantity and price. Both rows have to be
+# dropped. Maps the cancelling raw action to the raw action it reverses.
+CANCELLATION_ACTIONS: Final[dict[str, str]] = {
+    "Cancel Buy": "Buy",
+    "Reinvestment Adj": "Reinvest Shares",
+}
 
 
 class RequiredTransactionsColumn(StrEnum):
@@ -102,7 +111,6 @@ def action_from_str(label: str, file: Path) -> ActionType:
         "Wire Sent",
         "Funds Received",
         "Journal",
-        "Cash In Lieu",
         "Visa Purchase",
         "MoneyLink Deposit",
         "MoneyLink Adj",  # likely a returned transfer
@@ -141,7 +149,7 @@ def action_from_str(label: str, file: Path) -> ActionType:
     if label in ["Credit Interest", "Bond Interest"]:
         return ActionType.INTEREST
 
-    if label == "Reinvest Shares":
+    if label in ["Reinvest Shares", "Reinvestment Adj"]:
         return ActionType.REINVEST_SHARES
 
     if label == "Reinvest Dividend":
@@ -150,7 +158,7 @@ def action_from_str(label: str, file: Path) -> ActionType:
     if label == "Wire Funds Received":
         return ActionType.WIRE_FUNDS_RECEIVED
 
-    if label == "Stock Split":
+    if label in ["Stock Split", "Reverse Split"]:
         return ActionType.STOCK_SPLIT
 
     if label in ["Cash Merger", "Cash Merger Adj"]:
@@ -158,6 +166,9 @@ def action_from_str(label: str, file: Path) -> ActionType:
 
     if label in ["Full Redemption", "Full Redemption Adj"]:
         return ActionType.FULL_REDEMPTION
+
+    if label == "Cash In Lieu":
+        return ActionType.CAPITAL_DISTRIBUTION
 
     raise ParsingError(file, f"Unknown action: '{label}'")
 
@@ -396,6 +407,84 @@ def _combine_full_redemption_pair(
     return unified
 
 
+def _combine_reverse_split_rows(
+    rows: list[SchwabTransaction],
+    transactions_file: Path,
+) -> SchwabTransaction:
+    """Combine the rows of one Reverse Split into a single net transaction.
+
+    Schwab books a share consolidation as two rows on the same date for the
+    same security: one removing the old units and one adding the new ones.
+    Only the net change in units matters, so they are summed into one row.
+    """
+    quantities = [row.quantity for row in rows]
+    if any(quantity is None for quantity in quantities):
+        raise ParsingError(
+            transactions_file,
+            f"Reverse Split of {rows[0].symbol} on {rows[0].date} "
+            "has a row without a quantity",
+        )
+    net_quantity = sum(
+        (quantity for quantity in quantities if quantity is not None), Decimal(0)
+    )
+    if net_quantity >= 0:
+        # A consolidation always leaves fewer units. A net gain means only the
+        # replacement leg is present: the removal leg fell on another date, or
+        # dropped out of Schwab's four-year export window. Booking it as-is
+        # would hand over free units at nil cost.
+        raise ParsingError(
+            transactions_file,
+            f"Reverse Split of {rows[0].symbol} on {rows[0].date} nets to "
+            f"{net_quantity} units. A consolidation must reduce the holding, "
+            "so the rows removing the old units are missing.",
+        )
+
+    unified = rows[0]
+    unified.quantity = net_quantity
+    unified.fees = sum((row.fees for row in rows[1:]), unified.fees)
+    return unified
+
+
+def _unify_reverse_splits(
+    transactions: list[SchwabTransaction],
+    transactions_file: Path,
+) -> list[SchwabTransaction]:
+    """Collapse each multi-row Reverse Split into a single net transaction."""
+    if not any(
+        transaction.raw_action == "Reverse Split" for transaction in transactions
+    ):
+        return transactions
+
+    # Group by (date, symbol) across the whole list rather than by adjacency:
+    # two securities consolidating on the same date can be interleaved in the
+    # export, which would otherwise leave each one split into separate rows.
+    groups: dict[tuple[datetime.date, str | None], list[SchwabTransaction]] = (
+        defaultdict(list)
+    )
+    for transaction in transactions:
+        if transaction.raw_action == "Reverse Split":
+            groups[(transaction.date, transaction.symbol)].append(transaction)
+
+    combined = {
+        key: _combine_reverse_split_rows(group, transactions_file)
+        for key, group in groups.items()
+    }
+
+    unified: list[SchwabTransaction] = []
+    emitted: set[tuple[datetime.date, str | None]] = set()
+    for transaction in transactions:
+        if transaction.raw_action != "Reverse Split":
+            unified.append(transaction)
+            continue
+        key = (transaction.date, transaction.symbol)
+        # Emit each consolidation once, at the position of its first row.
+        if key not in emitted:
+            emitted.add(key)
+            unified.append(combined[key])
+
+    return unified
+
+
 def _unify_schwab_paired_transactions(
     transactions: list[SchwabTransaction],
     transactions_file: Path,
@@ -483,37 +572,40 @@ def _unify_schwab_paired_transactions(
     return filtered
 
 
-def _filter_cancelled_buy_transactions(
+def _filter_cancelled_transactions(
     transactions: list[SchwabTransaction],
 ) -> list[SchwabTransaction]:
-    """Filter out Cancel Buy transactions and their matching Buy transactions.
+    """Filter out cancellation rows and the transactions they reverse.
 
-    Schwab reports both the original Buy and a "Cancel Buy" transaction when a
-    purchase is cancelled. Both need to be removed to avoid incorrect capital
+    Schwab reports both the original transaction and a later cancellation row
+    when a transaction is reversed: "Cancel Buy" for a cancelled "Buy", and
+    "Reinvestment Adj" for a dividend reinvestment that is rebooked at a
+    different price. Both rows need to be removed to avoid incorrect capital
     gains calculations.
 
-    This is a Schwab-specific quirk - other brokers may not report cancellations
-    at all or may handle them differently.
+    This is a Schwab-specific quirk - other brokers may not report
+    cancellations at all or may handle them differently.
 
     Note: this runs on the raw, newest-first ordered list of transactions as
     read from the Schwab export (before ``transactions.reverse()`` is applied
-    by the caller). A Cancel Buy row is chronologically *after* the Buy it
-    cancels, so in a newest-first list the Cancel Buy has a *lower* index than
-    its Buy. We therefore search forward (increasing index = older dates) from
-    the Cancel Buy's index.
+    by the caller). A cancellation row is chronologically *after* the row it
+    cancels, so in a newest-first list it has a *lower* index than its
+    original. We therefore search forward (increasing index = older dates)
+    from the cancellation's index.
 
     Args:
         transactions: List of parsed Schwab transactions, newest-first
 
     Returns:
-        Filtered list with Cancel Buy pairs removed
+        Filtered list with cancelled pairs removed
 
     """
     indices_to_remove: set[int] = set()
 
-    # Find all Cancel Buy transactions
+    # Find all cancellation transactions
     for cancel_idx, transaction in enumerate(transactions):
-        if transaction.raw_action != "Cancel Buy":
+        original_action = CANCELLATION_ACTIONS.get(transaction.raw_action)
+        if original_action is None:
             continue
 
         # Already marked for removal
@@ -521,42 +613,58 @@ def _filter_cancelled_buy_transactions(
             continue
 
         # Search forward (older transactions, since the list is newest-first)
-        # for the matching Buy within the search window
-        for buy_idx in range(cancel_idx + 1, len(transactions)):
-            buy_txn = transactions[buy_idx]
+        # for the cancelled transaction within the search window. A flag rather
+        # than for/else: the window check below leaves the loop with a break,
+        # which would skip an else clause on every realistic export.
+        matched = False
+        for original_idx in range(cancel_idx + 1, len(transactions)):
+            original_txn = transactions[original_idx]
 
             # Stop if beyond search window
-            if abs((buy_txn.date - transaction.date).days) > CANCEL_BUY_SEARCH_DAYS:
+            if abs((original_txn.date - transaction.date).days) > CANCEL_BUY_SEARCH_DAYS:
                 break
 
             # Skip if already marked for removal
-            if buy_idx in indices_to_remove:
+            if original_idx in indices_to_remove:
                 continue
 
-            # Check if this is the matching Buy transaction
+            # Check if this is the transaction being cancelled
             if (
-                buy_txn.action == ActionType.BUY
-                and buy_txn.symbol == transaction.symbol
-                and buy_txn.quantity == transaction.quantity
-                and buy_txn.price == transaction.price
+                original_txn.raw_action == original_action
+                and original_txn.symbol == transaction.symbol
+                and original_txn.quantity == transaction.quantity
+                and original_txn.price == transaction.price
             ):
                 # Found matching pair - mark both for removal
+                matched = True
                 indices_to_remove.add(cancel_idx)
-                indices_to_remove.add(buy_idx)
+                indices_to_remove.add(original_idx)
                 LOGGER.info(
-                    "Matched Cancel Buy with original Buy: symbol=%s, qty=%s, "
-                    "price=%s, buy_date=%s, cancel_date=%s",
-                    buy_txn.symbol,
-                    buy_txn.quantity,
-                    buy_txn.price,
-                    buy_txn.date,
+                    "Matched %s with original %s: symbol=%s, qty=%s, "
+                    "price=%s, original_date=%s, cancel_date=%s",
+                    transaction.raw_action,
+                    original_action,
+                    original_txn.symbol,
+                    original_txn.quantity,
+                    original_txn.price,
+                    original_txn.date,
                     transaction.date,
                 )
                 break
-        else:
-            # No matching Buy found
+
+        if not matched:
+            # No matching original found. The row stays in the list mapped to
+            # the action it reverses, which is rarely what the user wants: its
+            # amount has the opposite sign, so it usually fails later with a
+            # discrepancy error that says nothing about the real cause.
             LOGGER.warning(
-                "Could not find matching Buy for Cancel Buy: %s",
+                "Could not find a %s within %d days to match this %s, so it is "
+                "left in place as a %s. Its amount has the opposite sign to a "
+                "real one, so the calculation will probably fail on it: %s",
+                original_action,
+                CANCEL_BUY_SEARCH_DAYS,
+                transaction.raw_action,
+                original_action,
                 transaction,
             )
 
@@ -739,6 +847,7 @@ class SchwabParser(BaseSingleFileParser):
 
             transactions.append(transaction)
         transactions = _unify_schwab_paired_transactions(transactions, file_path)
-        transactions = _filter_cancelled_buy_transactions(transactions)
+        transactions = _unify_reverse_splits(transactions, file_path)
+        transactions = _filter_cancelled_transactions(transactions)
         transactions.reverse()
         return list(transactions)

@@ -134,11 +134,18 @@ class IsinConverter:
         return result
 
     def get_symbol_to_isin_map(self) -> dict[str, str]:
-        """Return a map from symbols to isin's."""
+        """Return a map from symbols to isin's.
+
+        An ISIN whose ticker is unknown is recorded with an empty symbol, so
+        empty entries are skipped here. Keeping them would put an "" key in the
+        map, and every transaction without a symbol - interest, transfers, fees
+        - would then resolve to whichever ISIN happened to own that key.
+        """
         symbol_to_isin = {}
         for isin, symbols in self.data.items():
             for symbol in symbols:
-                symbol_to_isin[symbol] = isin
+                if symbol:
+                    symbol_to_isin[symbol] = isin
         return symbol_to_isin
 
     def _read_isin_translation_data(self) -> None:

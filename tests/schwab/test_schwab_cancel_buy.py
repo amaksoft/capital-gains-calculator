@@ -215,3 +215,69 @@ class TestCancelBuyFiltering:
         # AAPL Buy and Cancel Buy should be matched and removed; MSFT remains.
         assert len(transactions) == 1
         assert transactions[0].symbol == "MSFT"
+
+
+class TestReinvestmentAdjFiltering:
+    """Test that a Reinvestment Adj cancels its original Reinvest Shares.
+
+    Schwab occasionally rebooks a dividend reinvestment at a corrected price. It
+    reports the reversal as a "Reinvestment Adj" row carrying the *original*
+    quantity and price with the opposite amount, followed by a fresh "Reinvest
+    Shares" row at the corrected price. Only the corrected row may survive.
+    """
+
+    def test_reinvestment_adj_removes_both_transactions(self, tmp_path: Path) -> None:
+        """The adjustment and the reinvestment it reverses are both dropped."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "11/17/2025,Reinvest Shares,ABBV,ABBVIE INC,$232.1131,0.5362,,-$124.47\n"
+            "11/17/2025,Reinvestment Adj,ABBV,ABBVIE INC,$231.00,0.5388,,$124.47\n"
+            "11/14/2025,Reinvest Shares,ABBV,ABBVIE INC,$231.00,0.5388,,-$124.47\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        # Only the corrected reinvestment survives.
+        assert len(transactions) == 1
+        assert transactions[0].price == Decimal("232.1131")
+        assert transactions[0].quantity == Decimal("0.5362")
+
+    def test_reinvestment_adj_does_not_cancel_a_buy(self, tmp_path: Path) -> None:
+        """A Reinvestment Adj only matches a Reinvest Shares, never a Buy."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "11/17/2025,Reinvestment Adj,ABBV,ABBVIE INC,$231.00,10,,$2310.00\n"
+            "11/14/2025,Buy,ABBV,ABBVIE INC,$231.00,10,,-$2310.00\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        assert len(transactions) == 2
+
+    def test_cancel_buy_does_not_cancel_a_reinvestment(self, tmp_path: Path) -> None:
+        """A Cancel Buy only matches a Buy, never a Reinvest Shares."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "11/17/2025,Cancel Buy,ABBV,ABBVIE INC,$231.00,10,,$2310.00\n"
+            "11/14/2025,Reinvest Shares,ABBV,ABBVIE INC,$231.00,10,,-$2310.00\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        assert len(transactions) == 2
+
+    def test_unmatched_reinvestment_adj_is_kept(self, tmp_path: Path) -> None:
+        """Outside the search window nothing is removed."""
+        csv_file = tmp_path / "transactions.csv"
+        csv_file.write_text(
+            "Date,Action,Symbol,Description,Price,Quantity,Fees & Comm,Amount\n"
+            "11/25/2025,Reinvestment Adj,ABBV,ABBVIE INC,$231.00,0.5388,,$124.47\n"
+            "11/14/2025,Reinvest Shares,ABBV,ABBVIE INC,$231.00,0.5388,,-$124.47\n"
+        )
+
+        transactions = SchwabParser().load_from_file(csv_file)
+
+        assert len(transactions) == 2

@@ -170,7 +170,7 @@ def action_from_str(label: str, file: Path) -> ActionType:
     if label == "Wire Funds Received":
         return ActionType.WIRE_FUNDS_RECEIVED
 
-    if label == "Stock Split":
+    if label in {"Stock Split", "Reverse Split"}:
         return ActionType.STOCK_SPLIT
 
     if label in {"Cash Merger", "Cash Merger Adj"}:
@@ -426,6 +426,78 @@ def _combine_full_redemption_pair(
     unified.price = amount / unified.quantity
     unified.fees += full_redemption_adj.fees
 
+    return unified
+
+
+def _combine_reverse_split_rows(
+    rows: list[SchwabTransaction],
+    transactions_file: Path,
+) -> SchwabTransaction:
+    """Combine the rows of one Reverse Split into a single net transaction.
+
+    Schwab books a share consolidation as two rows on the same date for the
+    same security: one removing the old units and one adding the new ones.
+    Only the net change in units matters, so they are summed into one row.
+    """
+    quantities = [row.quantity for row in rows]
+    if any(quantity is None for quantity in quantities):
+        raise ParsingError(
+            transactions_file,
+            f"Reverse Split of {rows[0].symbol} on {rows[0].date} "
+            "has a row without a quantity",
+        )
+    net_quantity = sum(
+        (quantity for quantity in quantities if quantity is not None), Decimal(0)
+    )
+    if net_quantity >= 0:
+        # A consolidation always leaves fewer units. A net gain means only the
+        # replacement leg is present: the removal leg fell on another date, or
+        # dropped out of Schwab's four-year export window. Booking it as-is
+        # would hand over free units at nil cost.
+        raise ParsingError(
+            transactions_file,
+            f"Reverse Split of {rows[0].symbol} on {rows[0].date} nets to "
+            f"{net_quantity} units. A consolidation must reduce the holding, "
+            "so the rows removing the old units are missing.",
+        )
+
+    unified = rows[0]
+    unified.quantity = net_quantity
+    unified.fees = sum((row.fees for row in rows[1:]), unified.fees)
+    return unified
+
+
+def _unify_reverse_splits(
+    transactions: list[SchwabTransaction],
+    transactions_file: Path,
+) -> list[SchwabTransaction]:
+    """Collapse each multi-row Reverse Split into a single net transaction."""
+    if not any(
+        transaction.raw_action == "Reverse Split" for transaction in transactions
+    ):
+        return transactions
+
+    # Group by (date, symbol) across the whole list rather than by adjacency:
+    # two securities consolidating on the same date can be interleaved in the
+    # export, which would otherwise leave each one split into separate rows.
+    groups: dict[tuple[datetime.date, str | None], list[SchwabTransaction]] = (
+        defaultdict(list)
+    )
+    for transaction in transactions:
+        if transaction.raw_action == "Reverse Split":
+            groups[transaction.date, transaction.symbol].append(transaction)
+
+    unified: list[SchwabTransaction] = []
+    emitted: set[tuple[datetime.date, str | None]] = set()
+    for transaction in transactions:
+        if transaction.raw_action != "Reverse Split":
+            unified.append(transaction)
+            continue
+        key = (transaction.date, transaction.symbol)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        unified.append(_combine_reverse_split_rows(groups[key], transactions_file))
     return unified
 
 
@@ -905,6 +977,7 @@ class SchwabParser(BaseSingleFileParser[SchwabTransaction]):
         """Read Schwab transactions from file."""
         transactions = cls._read_rows(file, file_path)
         transactions = _unify_schwab_paired_transactions(transactions, file_path)
+        transactions = _unify_reverse_splits(transactions, file_path)
         transactions = _filter_cancelled_buy_transactions(transactions, file_path)
         transactions.reverse()
         return transactions
@@ -963,7 +1036,10 @@ class SchwabParser(BaseSingleFileParser[SchwabTransaction]):
         exports = [
             replace(
                 export,
-                rows=_unify_schwab_paired_transactions(export.rows, export.file_path),
+                rows=_unify_reverse_splits(
+                    _unify_schwab_paired_transactions(export.rows, export.file_path),
+                    export.file_path,
+                ),
             )
             for export in exports
         ]

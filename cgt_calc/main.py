@@ -225,6 +225,10 @@ class CapitalGainsCalculator:
         self.transfer_to_spouse_list: HmrcTransactionLog = {}
         self.bnb_list: HmrcTransactionLog = {}
         self.split_list: dict[tuple[str, datetime.date], Decimal] = {}
+        # Units cancelled by a share consolidation, per date and symbol.
+        self.consolidation_list: dict[datetime.date, dict[str, Decimal]] = defaultdict(
+            dict
+        )
         # Shares a split added, by symbol and date. They sit in
         # acquisition_list so they reach the pool, but they cost nothing and
         # are not an acquisition a disposal can be identified against
@@ -353,19 +357,106 @@ class CapitalGainsCalculator:
         )
 
     def add_stock_split(self, transaction: BrokerTransaction) -> None:
-        """Record a stock split during the first pass.
+        """Record a stock split or share consolidation during the first pass.
 
-        The multiplier is kept for the bed and breakfast quantity adjustment,
-        and the new shares are added as a zero-cost acquisition.
+        Both arrive as a change in unit count with no cash involved. A positive
+        change is a forward split, booked as a zero-cost acquisition; a negative
+        one is a consolidation, where units are cancelled and the pool cost is
+        left alone. Either way the multiplier is kept for the bed and breakfast
+        quantity adjustment.
         """
         acquired_quantity = get_quantity_or_fail(transaction)
         symbol = get_symbol_or_fail(transaction)
         holding_quantity = self.portfolio[symbol].quantity
+
+        if holding_quantity <= 0:
+            raise InvalidTransactionError(
+                transaction,
+                "Stock split of a symbol which is not held at that date",
+            )
+        if acquired_quantity + holding_quantity <= 0:
+            # A split has to leave a holding behind. Cancelling all of it, or
+            # more, is a liquidation, and the cost basis treatment differs, so
+            # refuse rather than guess.
+            raise InvalidTransactionError(
+                transaction,
+                f"Stock split leaves no units: {holding_quantity} held and "
+                f"{-acquired_quantity} cancelled at that date",
+            )
+
         self.split_list[symbol, transaction.date] = (
             acquired_quantity + holding_quantity
         ) / holding_quantity
         self.split_shares[symbol, transaction.date] += acquired_quantity
-        self.add_acquisition(transaction)
+
+        if acquired_quantity > 0:
+            self.add_acquisition(transaction)
+            return
+
+        # Share consolidation (reverse split): units are cancelled instead of
+        # added. It is a reorganisation, not a disposal, so the pool cost is
+        # unchanged and no gain arises. Ref: TCGA 1992 s127.
+        self.consolidation_list[transaction.date][symbol] = (
+            self.consolidation_list[transaction.date].get(symbol, Decimal(0))
+            - acquired_quantity
+        )
+        # Keep the running holding in step, exactly as add_acquisition does for
+        # the forward-split branch above. Later events in this pass - split
+        # multipliers, spin-off apportionment, the over-sell guard - read it.
+        self.portfolio[symbol] = Position(
+            holding_quantity + acquired_quantity,
+            self.portfolio[symbol].amount,
+        )
+
+    def process_consolidation(
+        self,
+        symbol: str,
+        cancelled_quantity: Decimal,
+    ) -> CalculationEntry:
+        """Cancel units of a share consolidation, keeping the pool cost."""
+        position = self.portfolio.get(symbol, Position())
+        if cancelled_quantity > position.quantity:
+            raise CalculationError(
+                f"Share consolidation of {symbol} cancels {cancelled_quantity} "
+                f"units but only {position.quantity} are held"
+            )
+        self.portfolio[symbol] = Position(
+            position.quantity - cancelled_quantity, position.amount
+        )
+        new_quantity = self.portfolio[symbol].quantity
+        new_pool_cost = self.portfolio[symbol].amount
+        if new_quantity == 0:
+            # Mirror add_disposal: a nil holding leaves the portfolio rather
+            # than lingering as a 0-unit line still carrying the pool cost.
+            del self.portfolio[symbol]
+        return CalculationEntry(
+            rule_type=RuleType.SHARE_CONSOLIDATION,
+            quantity=cancelled_quantity,
+            amount=Decimal(0),
+            fees=Decimal(0),
+            new_quantity=new_quantity,
+            new_pool_cost=new_pool_cost,
+            allowable_cost=new_pool_cost,
+        )
+
+    def process_reorganisations(
+        self,
+        date_index: datetime.date,
+        tax_year_start_index: datetime.date,
+        calculation_log: CalculationLog,
+    ) -> None:
+        """Apply the reorganisations falling on one date.
+
+        These adjust an existing holding rather than acquiring or disposing of
+        anything, so they run after that date's acquisitions but before its
+        disposals: a sale on the day of a consolidation is denominated in the
+        new units, so apportioning its cost over the pre-consolidation unit
+        count would understate the allowable cost and overstate the gain.
+        """
+        for symbol, cancelled in self.consolidation_list.get(date_index, {}).items():
+            entry = self.process_consolidation(symbol, cancelled)
+            if date_index >= tax_year_start_index:
+                calculation_log[date_index][f"consolidation${symbol}"] = [entry]
 
     def handle_spin_off(
         self,
@@ -2357,6 +2448,9 @@ class CapitalGainsCalculator:
             for source, entries in self.spin_off_entries.pop(date_index, {}).items():
                 if date_index >= tax_year_start_index:
                     calculation_log[date_index][f"spin-off${source}"] = entries
+            self.process_reorganisations(
+                date_index, tax_year_start_index, calculation_log
+            )
             if date_index in self.disposal_list:
                 for symbol in self.disposal_list[date_index]:
                     transaction_capital_gain, calculation_entries = (

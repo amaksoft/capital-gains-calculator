@@ -48,6 +48,9 @@
     \BLOCK{ set symbol = symbol[17:] }
     \BLOCK{ set is_disposal = True }
     \BLOCK{ set is_gift = True }
+\BLOCK{ elif symbol.startswith("consolidation$") }
+    \BLOCK{ set symbol = symbol[14:] }
+    \BLOCK{ set is_consolidation = True }
 \BLOCK{ endif }
 \BLOCK{ set overall_quantity = entries|sum(attribute="quantity") }
 \BLOCK{ set overall_fees = round_decimal(entries|sum(attribute="fees"), 2) }
@@ -105,6 +108,10 @@
             Spin-off adjustment \VAR{ acquisition_count.value }: \VAR{ entries[0].spin_off.source } cost adjusted because of \VAR{ entries[0].spin_off.dest } shares spinned off
         }
     \BLOCK{ endif }
+\BLOCK{ elif is_consolidation } % if is_consolidation
+    \subsubsection*{
+        Share consolidation: \VAR{ strip_zeros(entries[0].quantity + entries[0].new_quantity) } units of \VAR{ symbol } replaced by \VAR{ strip_zeros(entries[0].new_quantity) } units%
+    }
 \BLOCK{ elif is_eri } % if is_eri
     \BLOCK{ set acquisition_cost = round_decimal(entries[0].allowable_cost, 2) }
     \BLOCK{ if overall_quantity > 0 }
@@ -158,6 +165,8 @@
     original cost of \VAR{ entry.spin_off.source }: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2))}, after spin-off: £\VAR{ "{:,}".format(round_decimal(entry.new_pool_cost, 2))}
 \BLOCK{ elif is_eri }
     original cost of \VAR{ symbol }: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2))}, after income distribution: £\VAR{ "{:,}".format(round_decimal(entry.new_pool_cost, 2))}%
+\BLOCK{ elif is_consolidation }
+    no change to the pool cost.
 \BLOCK{ else } % if is_aquisition
     actual cost: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2)) }.
 \BLOCK{ endif}

@@ -317,6 +317,7 @@ class RuleType(Enum):
     RENAME = 9
     INTEREST_TAX = 10
     TRANSFER_TO_SPOUSE = 11
+    SHARE_CONSOLIDATION = 12
 
 
 @dataclass
@@ -388,6 +389,9 @@ class CalculationEntry:
             RuleType.INTEREST_TAX,
             RuleType.EXCESS_REPORTED_INCOME_DISTRIBUTION,
             RuleType.RENAME,
+            # A reorganisation, like RENAME above: the pool cost carries over
+            # to the surviving units, so it is reported without being spent.
+            RuleType.SHARE_CONSOLIDATION,
         }:
             assert self.gain == self.amount + self.fees - self.allowable_cost, (
                 f"Mismatch: {self.gain} != "

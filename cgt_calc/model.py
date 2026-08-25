@@ -264,11 +264,11 @@ class ActionType(Enum):
     GIFT = 24
     # The same, to someone who is not a connected person: a loss is ordinary.
     GIFT_UNCONNECTED = 25
-    # A purchase the broker reversed. Parsers are expected to drop it along
-    # with the purchase it reverses, so it never reaches the calculator; it
-    # exists so that a row which slips through is refused rather than booked
+    # A row the broker reversed, such as a purchase or a reinvestment.
+    # Parsers drop it along with the row it reverses or refuse the file, so it
+    # exists only so that one slipping through is refused rather than booked
     # as an acquisition.
-    CANCEL_BUY = 26
+    CANCELLATION = 26
 
 
 class CalculationType(Enum):

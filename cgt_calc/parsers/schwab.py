@@ -47,10 +47,17 @@ OLD_COLUMNS_NUM: Final = 9
 NEW_COLUMNS_NUM: Final = 8
 LOGGER = logging.getLogger(__name__)
 
-# Cancel Buy search window: Arbitrary time window chosen as a sensible limit for
-# how far to search backward from a Cancel Buy to find the original Buy transaction.
-# This is not based on any documented Schwab settlement period - just a practical limit.
-CANCEL_BUY_SEARCH_DAYS: Final = 5
+# How far to search back from a cancellation for the transaction it reverses.
+# Not based on any documented Schwab settlement period - just a practical limit.
+CANCELLATION_SEARCH_DAYS: Final = 5
+
+# Schwab reports a reversed transaction as a pair: the original row plus a later
+# cancellation row with the same symbol, quantity and price. Both have to be
+# dropped. Maps a cancelling raw action to the raw action it reverses.
+CANCELLATION_ACTIONS: Final[dict[str, str]] = {
+    "Cancel Buy": "Buy",
+    "Reinvestment Adj": "Reinvest Shares",
+}
 
 
 class RequiredTransactionsColumn(StrEnum):
@@ -106,10 +113,10 @@ def action_from_str(label: str, file: Path) -> ActionType:
     if label == "Buy":
         return ActionType.BUY
 
-    if label == "Cancel Buy":
-        # Not a purchase: it is dropped along with the Buy it reverses, and
-        # a cancellation with no matching Buy fails the run.
-        return ActionType.CANCEL_BUY
+    if label in CANCELLATION_ACTIONS:
+        # Not the transaction it names: it is dropped along with the row it
+        # reverses, and a cancellation with nothing to match fails the run.
+        return ActionType.CANCELLATION
 
     if label == "Sell":
         return ActionType.SELL
@@ -528,41 +535,43 @@ def _unify_schwab_paired_transactions(
     return filtered
 
 
-def _is_matching_buy(buy_txn: SchwabTransaction, cancel_txn: SchwabTransaction) -> bool:
-    """Whether buy_txn is the purchase that cancel_txn reverses.
+def _is_reversed_transaction(
+    buy_txn: SchwabTransaction, cancel_txn: SchwabTransaction
+) -> bool:
+    """Whether buy_txn is the transaction that cancel_txn reverses.
 
     The raw action is compared rather than the action type, so a cancellation
-    can never pair with another cancellation.
+    can never pair with another cancellation, and a "Cancel Buy" can only
+    claim a "Buy" rather than any reversible row that happens to line up.
     """
     return (
-        buy_txn.raw_action == "Buy"
+        buy_txn.raw_action == CANCELLATION_ACTIONS[cancel_txn.raw_action]
         and buy_txn.symbol == cancel_txn.symbol
         and buy_txn.quantity == cancel_txn.quantity
         and buy_txn.price == cancel_txn.price
     )
 
 
-def _find_matching_buy(
+def _find_reversed_transaction(
     transactions: list[SchwabTransaction],
     cancel_idx: int,
     consumed: set[int],
 ) -> int | None:
-    """Find the index of the Buy that the Cancel Buy at cancel_idx reverses.
+    """Find the index of the transaction that the cancellation reverses.
 
-    The list is newest-first, so the purchase being reversed normally sits at
-    a higher index than the cancellation. When the two share a date the export
-    orders them arbitrarily, so the purchase can equally sit just above it;
-    those rows are searched as well. A purchase on a date later than the
-    cancellation is never a match, because it had not happened yet when the
-    cancellation was recorded.
+    The list is newest-first, so the row being reversed normally sits at a
+    higher index than the cancellation. When the two share a date the export
+    orders them arbitrarily, so it can equally sit just above; those rows are
+    searched as well. A row dated later than the cancellation is never a
+    match, because it had not happened yet when the cancellation was recorded.
 
     Args:
         transactions: Parsed Schwab transactions, newest-first
-        cancel_idx: Index of the Cancel Buy to reconcile
+        cancel_idx: Index of the cancellation to reconcile
         consumed: Indices already claimed by an earlier pair
 
     Returns:
-        Index of the matching Buy, or None when there is none
+        Index of the reversed transaction, or None when there is none
 
     """
     cancel_txn = transactions[cancel_idx]
@@ -570,9 +579,9 @@ def _find_matching_buy(
     # Older rows, out to the edge of the search window.
     for buy_idx in range(cancel_idx + 1, len(transactions)):
         buy_txn = transactions[buy_idx]
-        if abs((buy_txn.date - cancel_txn.date).days) > CANCEL_BUY_SEARCH_DAYS:
+        if abs((buy_txn.date - cancel_txn.date).days) > CANCELLATION_SEARCH_DAYS:
             break
-        if buy_idx not in consumed and _is_matching_buy(buy_txn, cancel_txn):
+        if buy_idx not in consumed and _is_reversed_transaction(buy_txn, cancel_txn):
             return buy_idx
 
     # Newer rows, but only the ones sharing the cancellation's own date.
@@ -580,56 +589,58 @@ def _find_matching_buy(
         buy_txn = transactions[buy_idx]
         if buy_txn.date != cancel_txn.date:
             break
-        if buy_idx not in consumed and _is_matching_buy(buy_txn, cancel_txn):
+        if buy_idx not in consumed and _is_reversed_transaction(buy_txn, cancel_txn):
             return buy_idx
 
     return None
 
 
-def _filter_cancelled_buy_transactions(
+def _filter_cancelled_transactions(
     transactions: list[SchwabTransaction],
     file: Path,
 ) -> list[SchwabTransaction]:
-    """Filter out Cancel Buy transactions and their matching Buy transactions.
+    """Filter out cancellation rows and the transactions they reverse.
 
-    Schwab reports both the original Buy and a "Cancel Buy" transaction when a
-    purchase is cancelled. Both need to be removed to avoid incorrect capital
-    gains calculations.
+    Schwab reports a reversed transaction as a pair: the original row and a
+    later cancellation row with the same symbol, quantity and price. Both need
+    to be removed to avoid incorrect capital gains calculations. The pairs it
+    knows about are listed in CANCELLATION_ACTIONS.
 
     This is a Schwab-specific quirk - other brokers may not report cancellations
     at all or may handle them differently.
 
     Note: this runs on the raw, newest-first ordered list of transactions as
     read from the Schwab export (before ``transactions.reverse()`` is applied
-    by the caller). A Cancel Buy row is chronologically *after* the Buy it
-    cancels, so in a newest-first list the Cancel Buy normally has a *lower*
-    index than its Buy. Same-date rows are the exception, since the export
-    orders those arbitrarily; see ``_find_matching_buy`` for how both are
-    searched.
+    by the caller). A cancellation is chronologically *after* the row it
+    reverses, so in a newest-first list it normally has a *lower* index than
+    that row. Same-date rows are the exception, since the export orders those
+    arbitrarily; see ``_find_reversed_transaction`` for how both are searched.
 
     Args:
         transactions: List of parsed Schwab transactions, newest-first
         file: Source file, for error reporting
 
     Returns:
-        Filtered list with Cancel Buy pairs removed
+        Filtered list with cancellation pairs removed
 
     Raises:
-        ParsingError: If a Cancel Buy has no matching Buy
+        ParsingError: If a cancellation has nothing to reverse
 
     """
     indices_to_remove: set[int] = set()
 
-    # Find all Cancel Buy transactions
+    # Find every cancellation row
     for cancel_idx, transaction in enumerate(transactions):
-        if transaction.raw_action != "Cancel Buy":
+        if transaction.raw_action not in CANCELLATION_ACTIONS:
             continue
 
         # Already marked for removal
         if cancel_idx in indices_to_remove:
             continue
 
-        buy_idx = _find_matching_buy(transactions, cancel_idx, indices_to_remove)
+        buy_idx = _find_reversed_transaction(
+            transactions, cancel_idx, indices_to_remove
+        )
 
         if buy_idx is not None:
             # Found matching pair - mark both for removal
@@ -637,8 +648,9 @@ def _filter_cancelled_buy_transactions(
             indices_to_remove.add(buy_idx)
             buy_txn = transactions[buy_idx]
             LOGGER.debug(
-                "Matched Cancel Buy with original Buy: symbol=%s, qty=%s, "
-                "price=%s, buy_date=%s, cancel_date=%s",
+                "Matched %s with the row it reverses: symbol=%s, qty=%s, "
+                "price=%s, original_date=%s, cancel_date=%s",
+                transaction.raw_action,
                 buy_txn.symbol,
                 buy_txn.quantity,
                 buy_txn.price,
@@ -660,12 +672,13 @@ def _filter_cancelled_buy_transactions(
             raise ParsingError(
                 source.file if source and source.file else file,
                 f"Found a {transaction.raw_action} for {transaction.symbol} on "
-                f"{transaction.date} with no Buy to match it in the "
-                f"{CANCEL_BUY_SEARCH_DAYS} days before. The purchase may be "
-                "missing from the export, older than that window, recorded "
+                f"{transaction.date} with no "
+                f"{CANCELLATION_ACTIONS[transaction.raw_action]} to match it "
+                f"in the {CANCELLATION_SEARCH_DAYS} days before. That row may "
+                "be missing from the export, older than that window, recorded "
                 "with a different quantity or price, or already reversed by "
-                "another cancellation. Remove this row; remove the purchase "
-                "with it only if the purchase is still in the export and no "
+                "another cancellation. Remove this row; remove the row it "
+                "reverses with it only if that is still in the export and no "
                 "other cancellation reverses it.",
                 row_index=source.row if source else None,
             )
@@ -905,7 +918,7 @@ class SchwabParser(BaseSingleFileParser[SchwabTransaction]):
         """Read Schwab transactions from file."""
         transactions = cls._read_rows(file, file_path)
         transactions = _unify_schwab_paired_transactions(transactions, file_path)
-        transactions = _filter_cancelled_buy_transactions(transactions, file_path)
+        transactions = _filter_cancelled_transactions(transactions, file_path)
         transactions.reverse()
         return transactions
 
@@ -920,8 +933,8 @@ class SchwabParser(BaseSingleFileParser[SchwabTransaction]):
         Corporate-action pairing stays per file: both shapes it recognises are
         same-date by construction, and refusing overlapping exports first
         guarantees one date lives in exactly one file, so a pair can never be
-        split. Cancellation matching is the opposite: the Buy a Cancel Buy
-        reverses is up to CANCEL_BUY_SEARCH_DAYS away, so it routinely sits in
+        split. Cancellation matching is the opposite: the row a cancellation
+        reverses is up to CANCELLATION_SEARCH_DAYS away, so it routinely sits in
         the neighbouring file and can only be found once everything is merged.
         """
         # One directory is one declared account boundary, as it is for the
@@ -981,7 +994,7 @@ class SchwabParser(BaseSingleFileParser[SchwabTransaction]):
         exports.sort(key=lambda export: export.newest, reverse=True)
 
         transactions = [row for export in exports for row in export.rows]
-        transactions = _filter_cancelled_buy_transactions(transactions, dir_path)
+        transactions = _filter_cancelled_transactions(transactions, dir_path)
         transactions.reverse()
 
         # Checked after filtering, not before: a directory whose only rows are

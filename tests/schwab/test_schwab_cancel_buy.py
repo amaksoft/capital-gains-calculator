@@ -5,7 +5,7 @@ Buy transactions within the search window.
 
 Cancel Buy is a Schwab-specific transaction type that indicates a purchase was
 cancelled. Both rows have to be filtered out to avoid counting a purchase that
-never stood. The cancellation carries ActionType.CANCEL_BUY rather than the
+never stood. The cancellation carries ActionType.CANCELLATION rather than the
 type of a purchase, so a row that escapes the filter is refused downstream
 instead of being booked as an acquisition.
 
@@ -266,7 +266,7 @@ def test_cancel_buy_is_not_typed_as_a_purchase(tmp_path: Path) -> None:
     )
 
     assert cancel.raw_action == "Cancel Buy"
-    assert cancel.action is ActionType.CANCEL_BUY
+    assert cancel.action is ActionType.CANCELLATION
 
 
 def test_identical_cancellations_pair_with_the_buys(tmp_path: Path) -> None:

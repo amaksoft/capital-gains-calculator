@@ -62,7 +62,7 @@ def _load(**flags: str) -> list[BrokerTransaction]:
 def test_cancel_buy_matches_a_buy_in_another_file(tmp_path: Path) -> None:
     """The Buy a Cancel Buy reverses may sit in the neighbouring export.
 
-    The pair is within CANCEL_BUY_SEARCH_DAYS but falls either side of a chunk
+    The pair is within CANCELLATION_SEARCH_DAYS but falls either side of a chunk
     boundary. Parsing each file alone leaves the cancellation unmatched, which
     is a hard error, so this only works once the files are merged.
     """

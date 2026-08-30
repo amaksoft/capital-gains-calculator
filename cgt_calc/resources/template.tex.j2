@@ -39,6 +39,9 @@
 \BLOCK{ elif symbol.startswith("split$") }
     \BLOCK{ set symbol = symbol[6:] }
     \BLOCK{ set is_split = True }
+\BLOCK{ elif symbol.startswith("distribution$") }
+    \BLOCK{ set symbol = symbol[13:] }
+    \BLOCK{ set is_distribution = True }
 \BLOCK{ elif symbol.startswith("transfer-to-spouse$") }
     \BLOCK{ set symbol = symbol[19:] }
     \BLOCK{ set is_transfer_to_spouse = True }
@@ -119,6 +122,10 @@
             (£\VAR{ "{:,}".format(round_decimal(entries[0].eris[0].price, 4)) }/unit)%
         }
     \BLOCK{ endif }
+\BLOCK{ elif is_distribution } % if is_distribution
+    \subsubsection*{
+        Capital distribution: £\VAR{ "{:,}".format(round_decimal(entries[0].amount, 2)) } received on \VAR{ symbol }%
+    }
 \BLOCK{ elif is_rename } % if is_rename
     \subsubsection*{
         \VAR{ symbol } was renamed to \VAR{ entries[0].renamed_to }%
@@ -181,7 +188,10 @@
 \BLOCK{ if not is_rename and not is_transfer_to_spouse and not is_split }
 \begin{enumerate}
 \BLOCK{ for entry in entries }
-\item \textbf{\VAR{ entry.rule_type.name.replace("_", " ") }}. Quantity: \VAR{ strip_zeros(entry.quantity) },
+\item \textbf{\VAR{ entry.rule_type.name.replace("_", " ") }}.
+\BLOCK{ if not is_distribution }
+    Quantity: \VAR{ strip_zeros(entry.quantity) },
+\BLOCK{ endif }
 \BLOCK{ if is_disposal }
     \BLOCK{ if entry.quantity < overall_quantity }
         disposal proceeds: £\VAR{ "{:,}".format(round_decimal(entry.amount + entry.fees, 2)) },
@@ -218,6 +228,8 @@
     original cost of \VAR{ entry.spin_off.source }: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2))}, after spin-off: £\VAR{ "{:,}".format(round_decimal(entry.new_pool_cost, 2))}
 \BLOCK{ elif is_eri }
     original cost of \VAR{ symbol }: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2))}, after income distribution: £\VAR{ "{:,}".format(round_decimal(entry.new_pool_cost, 2))}%
+\BLOCK{ elif is_distribution }
+    £\VAR{ "{:,}".format(round_decimal(entry.allowable_cost, 2)) } deducted from the pool cost, treated as a small capital distribution rather than a part disposal.
 \BLOCK{ else } % if is_aquisition
     actual cost: £\VAR{ "{:,}".format(round_decimal(-entry.amount, 2)) }.
 \BLOCK{ endif}

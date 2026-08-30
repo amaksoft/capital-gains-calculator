@@ -269,6 +269,9 @@ class ActionType(Enum):
     # exists so that a row which slips through is refused rather than booked
     # as an acquisition.
     CANCEL_BUY = 26
+    # Cash paid out on a reorganisation, most often in lieu of a fractional
+    # share. It comes out of the holding's cost rather than being income.
+    CAPITAL_DISTRIBUTION = 27
 
 
 class CalculationType(Enum):
@@ -388,6 +391,7 @@ class RuleType(Enum):
     INTEREST_TAX = 10
     TRANSFER_TO_SPOUSE = 11
     STOCK_SPLIT = 12
+    CAPITAL_DISTRIBUTION = 13
 
 
 @dataclass

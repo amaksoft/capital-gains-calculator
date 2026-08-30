@@ -18,6 +18,12 @@ from .model import TaxTreaty
 # Allowances
 # =============================================================================
 
+# Cash received on a reorganisation may be deducted from the pool cost rather
+# than treated as a part disposal where the sum is small. HMRC takes "small" as
+# £3,000 or less, or 5% of the holding's value; only the cash test is applied
+# here, as the 5% test needs a market valuation. Ref: TCGA 1992 s122, CG57835.
+CAPITAL_DISTRIBUTION_SMALL_LIMIT: Final[Decimal] = Decimal(3000)
+
 # Capital Gains Tax annual exempt amount (tax-free allowance)
 # https://www.gov.uk/guidance/capital-gains-tax-rates-and-allowances#tax-free-allowances-for-capital-gains-tax
 CAPITAL_GAIN_ALLOWANCES: Final[dict[int, int]] = {

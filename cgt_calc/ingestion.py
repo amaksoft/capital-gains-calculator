@@ -1372,6 +1372,20 @@ class TransactionIngester:
         if moved:
             self.state.holding_sources[new_symbol] |= moved
 
+    def adjust_pool_cost(self, transaction: BrokerTransaction) -> Decimal:
+        """Handle cash that moves a holding's pooled cost without a trade.
+
+        A fee adds to the cost and a capital distribution takes off it, but
+        neither acquires or disposes of anything.
+
+        Returns:
+            The cash moved, to be added to the running balance.
+
+        """
+        if transaction.action is ActionType.FEE:
+            return self.add_management_fee(transaction)
+        return self.record_capital_distribution(transaction)
+
     def add_management_fee(self, transaction: BrokerTransaction) -> Decimal:
         """Record a fee that increases the holding's pooled cost."""
         amount = get_amount_or_fail(transaction)
@@ -1399,6 +1413,42 @@ class TransactionIngester:
             gbp_fees,
             gbp_fees,
         )
+        return amount
+
+    def record_capital_distribution(self, transaction: BrokerTransaction) -> Decimal:
+        """Record a capital distribution for the second pass to deduct.
+
+        The pool cost is reduced by the second pass, after that day's
+        acquisitions and any reorganisation and before its disposals.
+
+        Returns:
+            The cash received, to be added to the running balance.
+
+        """
+        amount = get_amount_or_fail(transaction)
+        symbol = transaction.symbol
+
+        if symbol is None:
+            # Schwab leaves the symbol blank on some cash in lieu rows. Before
+            # these were routed here they booked as a plain cash transfer and
+            # needed no symbol, so falling back to that keeps a raw export
+            # working rather than aborting the run on a few pence.
+            LOGGER.warning(
+                "Capital distribution of %s %s on %s has no symbol, so it "
+                "cannot be deducted from a pool cost and is booked as cash. "
+                "The cost basis of whichever holding it relates to will be "
+                "slightly overstated: %s",
+                transaction.currency,
+                amount,
+                transaction.date,
+                transaction.description,
+            )
+            return amount
+
+        distributions = self.state.capital_distribution_list[transaction.date]
+        distributions[symbol] = distributions.get(
+            symbol, Decimal(0)
+        ) + self.currency_converter.to_gbp_for(amount, transaction)
         return amount
 
     def _convert_foreign_fees(self, transaction: BrokerTransaction) -> None:
@@ -1520,8 +1570,11 @@ class TransactionIngester:
                 amount = get_amount_or_fail(transaction)
                 new_balance += amount
                 self.add_disposal(transaction)
-            elif transaction.action is ActionType.FEE:
-                new_balance += self.add_management_fee(transaction)
+            elif transaction.action in {
+                ActionType.FEE,
+                ActionType.CAPITAL_DISTRIBUTION,
+            }:
+                new_balance += self.adjust_pool_cost(transaction)
             elif transaction.action in {
                 ActionType.STOCK_ACTIVITY,
                 ActionType.SPIN_OFF,

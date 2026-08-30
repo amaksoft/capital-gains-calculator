@@ -70,6 +70,11 @@ class CalculatorState:
     holding_sources: dict[str, set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
+    # Small capital distributions in GBP, by date and symbol, deducted from
+    # the pool cost at the end of the day they arrive on.
+    capital_distribution_list: dict[datetime.date, dict[str, Decimal]] = field(
+        default_factory=lambda: defaultdict(dict)
+    )
     # Stores old->new mapping when a symbol changes its name.
     rename_list: dict[datetime.date, dict[str, str]] = field(
         default_factory=lambda: defaultdict(dict)

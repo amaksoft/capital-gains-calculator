@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from .const import (
     BED_AND_BREAKFAST_DAYS,
+    CAPITAL_DISTRIBUTION_SMALL_LIMIT,
     ERI_TAX_DATE_DELTA,
     INTERNAL_START_DATE,
     MAX_CONTENDED_DATES_SHOWN,
@@ -653,6 +654,92 @@ class Matcher:
         )
         chargeable_gain = round_decimal(chargeable_gain, 2)
         return chargeable_gain, calculation_entries
+
+    def record_capital_distributions(
+        self,
+        date_index: datetime.date,
+        tax_year_start_index: datetime.date,
+        calculation_log: CalculationLog,
+    ) -> None:
+        """Deduct each of the day's capital distributions from its pool."""
+        for symbol, distributed in self.state.capital_distribution_list.get(
+            date_index, {}
+        ).items():
+            entry = self.process_capital_distribution(symbol, distributed)
+            if entry and date_index >= tax_year_start_index:
+                calculation_log[date_index][f"distribution${symbol}"] = [entry]
+
+    def process_capital_distribution(
+        self,
+        symbol: str,
+        amount: Decimal,
+    ) -> CalculationEntry | None:
+        """Deduct a small capital distribution from the pool cost.
+
+        Cash received on a reorganisation - most often cash in lieu of a
+        fractional share left over by a spin-off, split or consolidation - is
+        strictly a part disposal of the holding. Where the sum is small, HMRC
+        instead allows it to be deducted from the allowable cost, so that no
+        gain arises now and the whole receipt is picked up when the holding is
+        eventually sold. "Small" is taken as £3,000 or less; the alternative
+        5%-of-value test needs a market valuation we do not have here.
+
+        Ref: TCGA 1992 s122, and HMRC CG57835.
+        """
+        # .get() rather than indexing: the portfolio is a defaultdict, so
+        # indexing a symbol that is not held would insert an empty Position and
+        # leave a phantom 0-unit line in the final portfolio.
+        position = self.state.portfolio.get(symbol, Position())
+
+        if position.quantity <= 0:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s, which is not held at that "
+                "date; leaving it as cash. If this relates to a holding outside "
+                "the imported history, the cost basis will be overstated.",
+                round_decimal(amount, 2),
+                symbol,
+            )
+            return None
+
+        if amount > CAPITAL_DISTRIBUTION_SMALL_LIMIT:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s is above the £%s small "
+                "distribution limit, so HMRC's deduction treatment may not apply "
+                "and a part disposal may need to be computed instead. Deducting "
+                "it from the pool cost for now.",
+                round_decimal(amount, 2),
+                symbol,
+                CAPITAL_DISTRIBUTION_SMALL_LIMIT,
+            )
+
+        deducted = min(amount, position.amount)
+        if deducted < amount:
+            LOGGER.warning(
+                "Capital distribution of £%s for %s exceeds its remaining pool "
+                "cost of £%s. The excess of £%s is a chargeable gain and is not "
+                "calculated automatically.",
+                round_decimal(amount, 2),
+                symbol,
+                round_decimal(position.amount, 2),
+                round_decimal(amount - deducted, 2),
+            )
+
+        self.state.portfolio[symbol] = Position(
+            position.quantity, normalize_amount(position.amount - deducted)
+        )
+        return CalculationEntry(
+            rule_type=RuleType.CAPITAL_DISTRIBUTION,
+            quantity=Decimal(0),
+            # What was actually taken off the pool, which is the whole receipt
+            # unless it was capped above. Reporting the full receipt here while
+            # showing no gain would state something untrue: any excess over the
+            # pool cost is chargeable, and is warned about rather than computed.
+            amount=deducted,
+            fees=Decimal(0),
+            new_quantity=self.state.portfolio[symbol].quantity,
+            new_pool_cost=self.state.portfolio[symbol].amount,
+            allowable_cost=deducted,
+        )
 
     def process_rename(self, old: str, new: str) -> CalculationEntry:
         """Transfer pool from old ticker to new ticker (no disposal)."""
@@ -1387,6 +1474,12 @@ class Matcher:
                 if date_index >= tax_year_start_index:
                     calculation_log[date_index][f"spin-off${source}"] = entries
             self.record_split_reconciliations(
+                date_index, tax_year_start_index, calculation_log
+            )
+            # After the day's acquisitions and any reorganisation that
+            # generated the fractional entitlement, and before its disposals,
+            # so a sale the same day is costed against the reduced pool.
+            self.record_capital_distributions(
                 date_index, tax_year_start_index, calculation_log
             )
             if date_index in self.state.disposal_list:

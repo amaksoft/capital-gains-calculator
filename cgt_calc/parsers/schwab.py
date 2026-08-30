@@ -122,7 +122,6 @@ def action_from_str(label: str, file: Path) -> ActionType:
         "Wire Sent",
         "Funds Received",
         "Journal",
-        "Cash In Lieu",
         "Visa Purchase",
         "MoneyLink Deposit",
         "MoneyLink Adj",  # likely a returned transfer
@@ -178,6 +177,11 @@ def action_from_str(label: str, file: Path) -> ActionType:
 
     if label in {"Full Redemption", "Full Redemption Adj"}:
         return ActionType.FULL_REDEMPTION
+
+    if label == "Cash In Lieu":
+        # Cash paid for a fractional share left over by a reorganisation. Not
+        # a plain cash movement: it comes out of the holding's cost.
+        return ActionType.CAPITAL_DISTRIBUTION
 
     raise ParsingError(file, f"Unknown action: '{label}'")
 

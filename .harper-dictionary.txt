@@ -63,6 +63,7 @@ CurrencyConverter
 currentPrice
 cusip
 dataclass
+defaultdict
 dest
 dataclasses
 DictReader

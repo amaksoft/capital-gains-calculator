@@ -278,7 +278,7 @@ def test_split_history_demands_a_price_floor_it_can_use() -> None:
         ("Cash Dividend", ActionType.DIVIDEND),
         ("Dividend", ActionType.DIVIDEND),
         ("MoneyLink Transfer", ActionType.TRANSFER),
-        ("Cash In Lieu", ActionType.TRANSFER),
+        ("Cash In Lieu", ActionType.CAPITAL_DISTRIBUTION),
         ("Stock Plan Activity", ActionType.STOCK_ACTIVITY),
         ("NRA Tax Adj", ActionType.DIVIDEND_TAX),
         ("NRA Withholding", ActionType.DIVIDEND_TAX),
